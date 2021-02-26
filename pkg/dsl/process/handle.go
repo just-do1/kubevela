@@ -9,6 +9,19 @@ import (
 	"github.com/oam-dev/kubevela/pkg/dsl/model"
 )
 
+const (
+	// OutputFieldName is the reference of context base object
+	OutputFieldName = "output"
+	// OutputsFieldName is the reference of context Auxiliaries
+	OutputsFieldName = "outputs"
+	// ConfigFieldName is the reference of context config
+	ConfigFieldName = "config"
+	// ContextName is the name of context
+	ContextName = "name"
+	// ContextAppName is the appName of context
+	ContextAppName = "appName"
+)
+
 // Context defines Rendering Context Interface
 type Context interface {
 	SetBase(base model.Instance)
@@ -20,6 +33,7 @@ type Context interface {
 }
 
 // Auxiliary are objects rendered by definition template.
+// the format for auxiliary resource is always: `outputs.<resourceName>`, it can be auxiliary workload or trait
 type Auxiliary struct {
 	Ins model.Instance
 	// Type will be used to mark definition label for OAM runtime to get the CRD
@@ -28,12 +42,6 @@ type Auxiliary struct {
 
 	// Workload or trait with multiple `outputs` will have a name, if name is empty, than it's the main of this type.
 	Name string
-
-	// IsOutputs will record the output path format of the Auxiliary
-	// it can be one of these two cases:
-	// false: the format is `output`, this means it's the main resource of the trait
-	// true: the format is `outputs.<resourceName>`, this means it can be auxiliary workload or trait
-	IsOutputs bool
 }
 
 type templateContext struct {
@@ -76,16 +84,26 @@ func (ctx *templateContext) AppendAuxiliaries(auxiliaries ...Auxiliary) {
 // BaseContextFile return cue format string of templateContext
 func (ctx *templateContext) BaseContextFile() string {
 	var buff string
-	buff += fmt.Sprintf("name: \"%s\"\n", ctx.name)
-	buff += fmt.Sprintf("appName: \"%s\"\n", ctx.appName)
+	buff += fmt.Sprintf(ContextName+": \"%s\"\n", ctx.name)
+	buff += fmt.Sprintf(ContextAppName+": \"%s\"\n", ctx.appName)
 
 	if ctx.base != nil {
-		buff += fmt.Sprintf("input: %s\n", structMarshal(ctx.base.String()))
+		buff += fmt.Sprintf(OutputFieldName+": %s\n", structMarshal(ctx.base.String()))
+	}
+
+	if len(ctx.auxiliaries) > 0 {
+		var auxLines []string
+		for _, auxiliary := range ctx.auxiliaries {
+			auxLines = append(auxLines, fmt.Sprintf("%s: %s", auxiliary.Name, structMarshal(auxiliary.Ins.String())))
+		}
+		if len(auxLines) > 0 {
+			buff += fmt.Sprintf(OutputsFieldName+": {%s}\n", strings.Join(auxLines, "\n"))
+		}
 	}
 
 	if len(ctx.configs) > 0 {
 		bt, _ := json.Marshal(ctx.configs)
-		buff += "config: " + string(bt)
+		buff += ConfigFieldName + ": " + string(bt)
 	}
 
 	return fmt.Sprintf("context: %s", structMarshal(buff))
@@ -95,13 +113,13 @@ func (ctx *templateContext) BaseContextLabels() map[string]string {
 
 	return map[string]string{
 		// appName is oam.LabelAppName
-		"appName": ctx.appName,
+		ContextAppName: ctx.appName,
 		// name is oam.LabelAppComponent
-		"name": ctx.name,
+		ContextName: ctx.name,
 	}
 }
 
-// GetK8sResource return models of templateContext
+// Output return model and auxiliaries of templateContext
 func (ctx *templateContext) Output() (model.Instance, []Auxiliary) {
 	return ctx.base, ctx.auxiliaries
 }

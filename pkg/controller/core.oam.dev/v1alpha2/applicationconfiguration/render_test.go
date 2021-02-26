@@ -19,6 +19,7 @@ package applicationconfiguration
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"testing"
 
 	"github.com/crossplane/crossplane-runtime/apis/core/v1alpha1"
@@ -35,11 +36,11 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	core "github.com/oam-dev/kubevela/apis/core.oam.dev"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha2"
-
 	"github.com/oam-dev/kubevela/pkg/oam"
 	"github.com/oam-dev/kubevela/pkg/oam/mock"
 	"github.com/oam-dev/kubevela/pkg/oam/util"
@@ -47,7 +48,7 @@ import (
 
 var _ ComponentRenderer = &components{}
 
-func TestRenderComponents(t *testing.T) {
+func TestRender(t *testing.T) {
 	errBoom := errors.New("boom")
 
 	namespace := "ns"
@@ -56,8 +57,8 @@ func TestRenderComponents(t *testing.T) {
 	componentName := "coolcomponent"
 	workloadName := "coolworkload"
 	traitName := "coolTrait"
-	revisionName := "coolcomponent-aa1111"
-	revisionName2 := "coolcomponent-bb2222"
+	revisionName := "coolcomponent-v1"
+	revisionName2 := "coolcomponent-v2"
 
 	ac := &v1alpha2.ApplicationConfiguration{
 		ObjectMeta: metav1.ObjectMeta{
@@ -74,6 +75,7 @@ func TestRenderComponents(t *testing.T) {
 			},
 		},
 	}
+
 	revAC := &v1alpha2.ApplicationConfiguration{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
@@ -89,6 +91,21 @@ func TestRenderComponents(t *testing.T) {
 			},
 		},
 	}
+
+	controlledAC := revAC.DeepCopy()
+	controlledAC.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion: v1alpha2.SchemeGroupVersion.String(),
+			Kind:       v1alpha2.ApplicationKind,
+			Controller: pointer.BoolPtr(true),
+		},
+	}
+	controlledAC.Spec.Components[0].RevisionName = revisionName2
+	controlledAC.SetAnnotations(map[string]string{
+		oam.AnnotationNewAppConfig:     strconv.FormatBool(true),
+		oam.AnnotationRollingComponent: revisionName + "," + revisionName2,
+		"keep":                         strconv.FormatBool(true),
+	})
 	ref := metav1.NewControllerRef(ac, v1alpha2.ApplicationConfigurationGroupVersionKind)
 	errTrait := errors.New("errTrait")
 
@@ -525,16 +542,454 @@ func TestRenderComponents(t *testing.T) {
 				},
 			},
 		},
+		"Success-With-AppControlledAppConfig-CloneSet": {
+			reason: "Workload name should be component name for CloneSet",
+			fields: fields{
+				client: &test.MockClient{MockGet: test.NewMockGetFn(nil, func(obj runtime.Object) error {
+					switch defObj := obj.(type) {
+					case *v1alpha2.Component:
+						ccomp := v1alpha2.Component{
+							Status: v1alpha2.ComponentStatus{
+								LatestRevision: &v1alpha2.Revision{Name: revisionName2},
+							},
+						}
+						ccomp.DeepCopyInto(defObj)
+					case *v1alpha2.TraitDefinition:
+						ttrait := v1alpha2.TraitDefinition{ObjectMeta: metav1.ObjectMeta{Name: traitName},
+							Spec: v1alpha2.TraitDefinitionSpec{RevisionEnabled: true}}
+						ttrait.DeepCopyInto(defObj)
+					case *v1.ControllerRevision:
+						rev := &v1.ControllerRevision{
+							ObjectMeta: metav1.ObjectMeta{Name: revisionName, Namespace: namespace},
+							Data: runtime.RawExtension{Object: &v1alpha2.Component{
+								ObjectMeta: metav1.ObjectMeta{
+									Name:      componentName,
+									Namespace: namespace,
+								},
+								Spec: v1alpha2.ComponentSpec{
+									Workload: runtime.RawExtension{
+										Object: &unstructured.Unstructured{},
+									},
+								},
+								Status: v1alpha2.ComponentStatus{
+									LatestRevision: &v1alpha2.Revision{Name: revisionName2},
+								},
+							}},
+							Revision: 2,
+						}
+						rev.DeepCopyInto(defObj)
+					}
+					return nil
+				})},
+				params: ParameterResolveFn(func(_ []v1alpha2.ComponentParameter, _ []v1alpha2.ComponentParameterValue) ([]Parameter, error) {
+					return nil, nil
+				}),
+				workload: ResourceRenderFn(func(_ []byte, _ ...Parameter) (*unstructured.Unstructured, error) {
+					w := &unstructured.Unstructured{
+						Object: map[string]interface{}{
+							"apiVersion": "apps.kruise.io/v1alpha1",
+							"kind":       "CloneSet",
+						},
+					}
+					return w, nil
+				}),
+				trait: ResourceRenderFn(func(_ []byte, _ ...Parameter) (*unstructured.Unstructured, error) {
+					t := &unstructured.Unstructured{}
+					t.SetName(traitName)
+					return t, nil
+				}),
+			},
+			args: args{ac: controlledAC},
+			want: want{
+				w: []Workload{
+					{
+						ComponentName:         componentName,
+						ComponentRevisionName: revisionName2,
+						Workload: func() *unstructured.Unstructured {
+							w := &unstructured.Unstructured{}
+							w.SetNamespace(namespace)
+							w.SetName(componentName)
+							w.SetOwnerReferences([]metav1.OwnerReference{*ref})
+							w.SetAnnotations(map[string]string{
+								oam.AnnotationAppGeneration: "0",
+							})
+							return w
+						}(),
+						RevisionEnabled: true,
+					},
+				},
+			},
+		},
+		"Success-With-AppControlledAppConfig-Deployment": {
+			reason: "Workload name should be component revision for Deployment",
+			fields: fields{
+				client: &test.MockClient{MockGet: test.NewMockGetFn(nil, func(obj runtime.Object) error {
+					switch defObj := obj.(type) {
+					case *v1alpha2.Component:
+						ccomp := v1alpha2.Component{
+							Status: v1alpha2.ComponentStatus{
+								LatestRevision: &v1alpha2.Revision{Name: revisionName2},
+							},
+						}
+						ccomp.DeepCopyInto(defObj)
+					case *v1alpha2.TraitDefinition:
+						ttrait := v1alpha2.TraitDefinition{ObjectMeta: metav1.ObjectMeta{Name: traitName},
+							Spec: v1alpha2.TraitDefinitionSpec{RevisionEnabled: true}}
+						ttrait.DeepCopyInto(defObj)
+					case *v1.ControllerRevision:
+						rev := &v1.ControllerRevision{
+							ObjectMeta: metav1.ObjectMeta{Name: revisionName, Namespace: namespace},
+							Data: runtime.RawExtension{Object: &v1alpha2.Component{
+								ObjectMeta: metav1.ObjectMeta{
+									Name:      componentName,
+									Namespace: namespace,
+								},
+								Spec: v1alpha2.ComponentSpec{
+									Workload: runtime.RawExtension{
+										Object: &unstructured.Unstructured{},
+									},
+								},
+								Status: v1alpha2.ComponentStatus{
+									LatestRevision: &v1alpha2.Revision{Name: revisionName2},
+								},
+							}},
+							Revision: 2,
+						}
+						rev.DeepCopyInto(defObj)
+					}
+					return nil
+				})},
+				params: ParameterResolveFn(func(_ []v1alpha2.ComponentParameter, _ []v1alpha2.ComponentParameterValue) ([]Parameter, error) {
+					return nil, nil
+				}),
+				workload: ResourceRenderFn(func(_ []byte, _ ...Parameter) (*unstructured.Unstructured, error) {
+					w := &unstructured.Unstructured{
+						Object: map[string]interface{}{
+							"apiVersion": "apps/v1",
+							"kind":       "Deployment",
+						},
+					}
+					return w, nil
+				}),
+				trait: ResourceRenderFn(func(_ []byte, _ ...Parameter) (*unstructured.Unstructured, error) {
+					t := &unstructured.Unstructured{}
+					t.SetName(traitName)
+					return t, nil
+				}),
+			},
+			args: args{ac: controlledAC},
+			want: want{
+				w: []Workload{
+					{
+						ComponentName:         componentName,
+						ComponentRevisionName: revisionName2,
+						Workload: func() *unstructured.Unstructured {
+							w := &unstructured.Unstructured{}
+							w.SetNamespace(namespace)
+							w.SetName(revisionName2)
+							w.SetOwnerReferences([]metav1.OwnerReference{*ref})
+							w.SetAnnotations(map[string]string{
+								oam.AnnotationAppGeneration: "0",
+							})
+							return w
+						}(),
+						RevisionEnabled: true,
+					},
+				},
+			},
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			r := &components{tc.fields.client, mock.NewMockDiscoveryMapper(), tc.fields.params, tc.fields.workload, tc.fields.trait}
+			r := &components{tc.fields.client, mock.NewMockDiscoveryMapper(), tc.fields.params,
+				tc.fields.workload, tc.fields.trait}
 			got, _, err := r.Render(tc.args.ctx, tc.args.ac)
 			if diff := cmp.Diff(tc.want.err, err, test.EquateErrors()); diff != "" {
 				t.Errorf("\n%s\nr.Render(...): -want error, +got error:\n%s\n", tc.reason, diff)
 			}
-			if diff := cmp.Diff(tc.want.w, got); diff != "" {
+			if isControlledByApp(tc.args.ac) {
+				// test the case of application generated AC
+				if diff := cmp.Diff(tc.want.w[0].ComponentName, got[0].ComponentName); diff != "" {
+					t.Errorf("\n%s\nr.Render(...): -want, +got:\n%s\n", tc.reason, diff)
+				}
+				if diff := cmp.Diff(tc.want.w[0].ComponentRevisionName, got[0].ComponentRevisionName); diff != "" {
+					t.Errorf("\n%s\nr.Render(...): -want, +got:\n%s\n", tc.reason, diff)
+				}
+				if diff := cmp.Diff(tc.want.w[0].Workload.GetName(), got[0].Workload.GetName()); diff != "" {
+					t.Errorf("\n%s\nr.Render(...): -want, +got:\n%s\n", tc.reason, diff)
+				}
+				if _, exit := got[0].Workload.GetAnnotations()[oam.AnnotationNewAppConfig]; exit {
+					t.Errorf("\n%s\nr.Render(...) workload should not get annotation:%s\n", tc.reason,
+						oam.AnnotationNewAppConfig)
+				}
+				if _, exit := got[0].Workload.GetAnnotations()[oam.AnnotationRollingComponent]; exit {
+					t.Errorf("\n%s\nr.Render(...) workload  should not get annotation:%s\n", tc.reason,
+						oam.AnnotationRollingComponent)
+				}
+				if got[0].Workload.GetAnnotations()["keep"] != "true" {
+					t.Errorf("\n%s\nr.Render(...) workload should get annotation:%s\n", tc.reason,
+						"keep")
+				}
+				if _, exit := got[0].Traits[0].Object.GetAnnotations()[oam.AnnotationRollingComponent]; exit {
+					t.Errorf("\n%s\nr.Render(...): trait should not get annotation:%s\n", tc.reason,
+						oam.AnnotationRollingComponent)
+				}
+				if got[0].Traits[0].Object.GetAnnotations()["keep"] != "true" {
+					t.Errorf("\n%s\nr.Render(...): trait should get annotation:%s\n", tc.reason,
+						"keep")
+				}
+			} else {
+				if diff := cmp.Diff(tc.want.w, got); diff != "" {
+					t.Errorf("\n%s\nr.Render(...): -want, +got:\n%s\n", tc.reason, diff)
+				}
+			}
+		})
+	}
+}
+
+func TestRenderComponent(t *testing.T) {
+	type field struct {
+		client   client.Reader
+		workload ResourceRenderer
+		trait    ResourceRenderer
+	}
+	type arg struct {
+		ac                *v1alpha2.ApplicationConfiguration
+		isControlledByApp bool
+		isCompRolling     bool
+		dag               *dag
+	}
+	type want struct {
+		w   Workload
+		err error
+	}
+
+	namespace := "ns"
+	acName := "coolappconfig1"
+	acUID := types.UID("definitely-a-uuid")
+	componentName := "coolcomponent"
+	traitName := "coolTrait"
+	revisionName := "coolcomponent-v1"
+	revisionName2 := "coolcomponent-v2"
+	ctx := context.TODO()
+	// Ac generated by application
+	revAC := &v1alpha2.ApplicationConfiguration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      acName,
+			UID:       acUID,
+		},
+		Spec: v1alpha2.ApplicationConfigurationSpec{
+			Components: []v1alpha2.ApplicationConfigurationComponent{
+				{
+					RevisionName: revisionName,
+					Traits:       []v1alpha2.ComponentTrait{{}},
+				},
+			},
+		},
+	}
+	ref := metav1.NewControllerRef(revAC, v1alpha2.ApplicationConfigurationGroupVersionKind)
+
+	revAC2 := revAC.DeepCopy()
+	revAC2.Spec.Components[0].RevisionName = revisionName2
+
+	componentRevision := v1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{Name: revisionName, Namespace: namespace},
+		Data: runtime.RawExtension{Object: &v1alpha2.Component{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      componentName,
+				Namespace: namespace,
+			},
+			Spec: v1alpha2.ComponentSpec{
+				Workload: runtime.RawExtension{
+					Object: &unstructured.Unstructured{},
+				},
+			},
+			Status: v1alpha2.ComponentStatus{
+				LatestRevision: &v1alpha2.Revision{Name: revisionName},
+			},
+		}},
+	}
+
+	mockGet := test.NewMockGetFn(nil, func(obj runtime.Object) error {
+		switch defObj := obj.(type) {
+		case *v1alpha2.TraitDefinition:
+			ttrait := v1alpha2.TraitDefinition{ObjectMeta: metav1.ObjectMeta{Name: traitName},
+				Spec: v1alpha2.TraitDefinitionSpec{RevisionEnabled: true}}
+			ttrait.DeepCopyInto(defObj)
+		case *v1.ControllerRevision:
+			rev := &componentRevision
+			rev.DeepCopyInto(defObj)
+		}
+		return nil
+	})
+	mockParams := ParameterResolveFn(func(_ []v1alpha2.ComponentParameter,
+		_ []v1alpha2.ComponentParameterValue) ([]Parameter,
+		error) {
+		return nil, nil
+	})
+	cases := map[string]struct {
+		reason string
+		fields field
+		args   arg
+		want   want
+	}{
+		//TODO: Add more failure cases
+		//  add more dependency related tests for any future changes
+		//  add more trait related tests
+		"Success-With-Newly-Changed-Component-Deployment": {
+			reason: "Workload name should be revision name for deployment and it should be disabled",
+			fields: field{
+				client: &test.MockClient{MockGet: mockGet},
+
+				workload: ResourceRenderFn(func(_ []byte, _ ...Parameter) (*unstructured.Unstructured, error) {
+					w := &unstructured.Unstructured{
+						Object: map[string]interface{}{
+							"apiVersion": "apps/v1",
+							"kind":       "Deployment",
+						},
+					}
+					return w, nil
+				}),
+				trait: ResourceRenderFn(func(_ []byte, _ ...Parameter) (*unstructured.Unstructured, error) {
+					t := &unstructured.Unstructured{}
+					t.SetName(traitName)
+					return t, nil
+				}),
+			},
+			args: arg{
+				ac:                revAC,
+				isControlledByApp: true,
+				isCompRolling:     true,
+			},
+			want: want{
+				w: Workload{
+					ComponentName:         componentName,
+					ComponentRevisionName: revisionName,
+					Workload: func() *unstructured.Unstructured {
+						w := &unstructured.Unstructured{}
+						w.SetName(revisionName)
+						w.SetOwnerReferences([]metav1.OwnerReference{*ref})
+						unstructured.SetNestedField(w.Object, true, "spec", "paused")
+						return w
+					}(),
+					RevisionEnabled: true,
+				},
+			},
+		},
+		"Success-With-Newly-Changed-Component-CloneSet": {
+			reason: "Workload name should be component name for CloneSet and it should be disabled",
+			fields: field{
+				client: &test.MockClient{MockGet: mockGet},
+				workload: ResourceRenderFn(func(_ []byte, _ ...Parameter) (*unstructured.Unstructured, error) {
+					w := &unstructured.Unstructured{
+						Object: map[string]interface{}{
+							"apiVersion": "apps.kruise.io/v1alpha1",
+							"kind":       "CloneSet",
+						},
+					}
+					return w, nil
+				}),
+				trait: ResourceRenderFn(func(_ []byte, _ ...Parameter) (*unstructured.Unstructured, error) {
+					t := &unstructured.Unstructured{}
+					t.SetName(traitName)
+					return t, nil
+				}),
+			},
+			args: arg{
+				ac:                revAC2,
+				isControlledByApp: true,
+				isCompRolling:     true,
+			},
+			want: want{
+				w: Workload{
+					ComponentName:         componentName,
+					ComponentRevisionName: revisionName2,
+					Workload: func() *unstructured.Unstructured {
+						w := &unstructured.Unstructured{}
+						w.SetName(componentName)
+						w.SetOwnerReferences([]metav1.OwnerReference{*ref})
+						unstructured.SetNestedField(w.Object, true, "spec", "updateStrategy", "paused")
+						return w
+					}(),
+					RevisionEnabled: true,
+				},
+			},
+		},
+		"Success-With-NoChange-Component-Deployment": {
+			reason: "Workload name should be revision name for deployment and it should be disabled",
+			fields: field{
+				client: &test.MockClient{MockGet: mockGet},
+				workload: ResourceRenderFn(func(_ []byte, _ ...Parameter) (*unstructured.Unstructured, error) {
+					w := &unstructured.Unstructured{
+						Object: map[string]interface{}{
+							"apiVersion": "apps/v1",
+							"kind":       "Deployment",
+						},
+					}
+					return w, nil
+				}),
+				trait: ResourceRenderFn(func(_ []byte, _ ...Parameter) (*unstructured.Unstructured, error) {
+					t := &unstructured.Unstructured{}
+					t.SetName(traitName)
+					return t, nil
+				}),
+			},
+			args: arg{
+				ac:                revAC,
+				isControlledByApp: true,
+				isCompRolling:     false,
+			},
+			want: want{
+				w: Workload{
+					ComponentName:         componentName,
+					ComponentRevisionName: revisionName,
+					Workload: func() *unstructured.Unstructured {
+						w := &unstructured.Unstructured{}
+						w.SetName(revisionName)
+						w.SetOwnerReferences([]metav1.OwnerReference{*ref})
+						return w
+					}(),
+					RevisionEnabled: true,
+				},
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := &components{tc.fields.client, mock.NewMockDiscoveryMapper(), mockParams,
+				tc.fields.workload, tc.fields.trait}
+			got, err := r.renderComponent(ctx, tc.args.ac.Spec.Components[0], tc.args.ac, tc.args.isControlledByApp,
+				tc.args.isCompRolling, tc.args.dag)
+			if diff := cmp.Diff(tc.want.err, err, test.EquateErrors()); diff != "" {
+				t.Errorf("\n%s\nr.Render(...): -want error, +got error:\n%s\n", tc.reason, diff)
+			}
+			if diff := cmp.Diff(tc.want.w.ComponentName, got.ComponentName); diff != "" {
 				t.Errorf("\n%s\nr.Render(...): -want, +got:\n%s\n", tc.reason, diff)
+			}
+			if diff := cmp.Diff(tc.want.w.ComponentRevisionName, got.ComponentRevisionName); diff != "" {
+				t.Errorf("\n%s\nr.Render(...): -want, +got:\n%s\n", tc.reason, diff)
+			}
+			if tc.args.isControlledByApp {
+				if diff := cmp.Diff(tc.want.w.Workload.GetName(), got.Workload.GetName()); diff != "" {
+					t.Errorf("\n%s\nr.Render(...): -want, +got:\n%s\n", tc.reason, diff)
+				}
+			}
+			if tc.args.isCompRolling {
+				wantedSpec, exist, err := unstructured.NestedFieldCopy(tc.want.w.Workload.Object, "spec")
+				assert.True(t, exist)
+				assert.True(t, err == nil)
+				gotSpec, exist, err := unstructured.NestedFieldCopy(got.Workload.Object, "spec")
+				assert.True(t, exist)
+				assert.True(t, err == nil)
+				if diff := cmp.Diff(wantedSpec, gotSpec); diff != "" {
+					t.Errorf("\n%s\nr.Render(...): -want, +got:\n%s\n", tc.reason, diff)
+				}
+			} else {
+				// we won't touch the spec
+				_, exist, err := unstructured.NestedFieldCopy(got.Workload.Object, "spec")
+				assert.False(t, exist)
+				assert.True(t, err == nil)
 			}
 		})
 	}
@@ -874,7 +1329,8 @@ func TestRenderTraitWithoutMetadataName(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			r := &components{tc.fields.client, mock.NewMockDiscoveryMapper(), tc.fields.params, tc.fields.workload, tc.fields.trait}
+			r := &components{tc.fields.client, mock.NewMockDiscoveryMapper(), tc.fields.params,
+				tc.fields.workload, tc.fields.trait}
 			got, _, _ := r.Render(tc.args.ctx, tc.args.ac)
 			if len(got) == 0 || len(got[0].Traits) == 0 || got[0].Traits[0].Object.GetName() != util.GenTraitName(componentName, ac.Spec.Components[0].Traits[0].DeepCopy(), "") {
 				t.Errorf("\n%s\nr.Render(...): -want error, +got error:\n%s\n", tc.reason, "Trait name is NOT "+
@@ -1007,37 +1463,52 @@ func TestSetWorkloadInstanceName(t *testing.T) {
 			}},
 			reason: "workloadName should align with componentName",
 		},
-		"set value error": {
-			u: &unstructured.Unstructured{Object: map[string]interface{}{
-				"metadata": []string{},
-			}},
-			c:      &v1alpha2.Component{ObjectMeta: metav1.ObjectMeta{Name: "comp"}, Status: v1alpha2.ComponentStatus{LatestRevision: &v1alpha2.Revision{Name: "rev-1"}}},
-			expErr: errors.Wrapf(errors.New("metadata is not an object"), errSetValueForField, instanceNamePath, "comp"),
-		},
-		"set value error for trait revisionEnabled": {
-			u: &unstructured.Unstructured{Object: map[string]interface{}{
-				"metadata": []string{},
-			}},
-			traitDefs: []v1alpha2.TraitDefinition{
-				{
-					Spec: v1alpha2.TraitDefinitionSpec{RevisionEnabled: false},
-				},
-			},
-			c:      &v1alpha2.Component{ObjectMeta: metav1.ObjectMeta{Name: "comp"}, Status: v1alpha2.ComponentStatus{LatestRevision: &v1alpha2.Revision{Name: "rev-1"}}},
-			expErr: errors.Wrapf(errors.New("metadata is not an object"), errSetValueForField, instanceNamePath, "comp"),
-		},
 	}
 	for name, ti := range tests {
 		t.Run(name, func(t *testing.T) {
 			if ti.expErr != nil {
-				assert.Equal(t, ti.expErr.Error(), SetWorkloadInstanceName(ti.traitDefs, ti.u, ti.c, ti.currentWorkload).Error())
+				assert.Equal(t, ti.expErr.Error(), setWorkloadInstanceName(ti.traitDefs, ti.u, ti.c,
+					ti.currentWorkload).Error())
 			} else {
-				err := SetWorkloadInstanceName(ti.traitDefs, ti.u, ti.c, ti.currentWorkload)
+				err := setWorkloadInstanceName(ti.traitDefs, ti.u, ti.c, ti.currentWorkload)
 				assert.NoError(t, err)
 				assert.Equal(t, ti.exp, ti.u, ti.reason)
 			}
 		})
 	}
+}
+
+func TestIsControlledByApp(t *testing.T) {
+	// not true even if the kind checks right
+	ac := &v1alpha2.ApplicationConfiguration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "namespace",
+			Name:      "acName",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "api",
+					Kind:       v1alpha2.ApplicationKind,
+				},
+			},
+		},
+	}
+	assert.False(t, isControlledByApp(ac))
+	// not true even the owner type checks right
+	ac.OwnerReferences = append(ac.OwnerReferences, metav1.OwnerReference{
+		APIVersion: v1alpha2.SchemeGroupVersion.String(),
+		Kind:       v1alpha2.ApplicationKind,
+	})
+	assert.False(t, isControlledByApp(ac))
+	// only true when it's the controller
+	ac.OwnerReferences[1].Controller = pointer.BoolPtr(true)
+	assert.True(t, isControlledByApp(ac))
+	// still true when it's not the only the controller
+	ac.OwnerReferences = append(ac.OwnerReferences, metav1.OwnerReference{
+		APIVersion: v1alpha2.SchemeGroupVersion.String(),
+		Kind:       v1alpha2.ApplicationDeploymentKind,
+		Controller: pointer.BoolPtr(true),
+	})
+	assert.True(t, isControlledByApp(ac))
 }
 
 func TestSetTraitProperties(t *testing.T) {
