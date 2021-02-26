@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha2"
+	"github.com/oam-dev/kubevela/pkg/oam"
 	"github.com/oam-dev/kubevela/pkg/oam/util"
 )
 
@@ -95,7 +96,7 @@ var expectedExceptApp = &Appfile{
 						"replicas": float64(10),
 					},
 					Template: `
-      output: {
+      outputs:scaler: {
       	apiVersion: "core.oam.dev/v1alpha2"
       	kind:       "ManualScalerTrait"
       	spec: {
@@ -129,7 +130,7 @@ spec:
   workloadRefPath: spec.workloadRef
   extension:
     template: |-
-      output: {
+      outputs: scaler: {
       	apiVersion: "core.oam.dev/v1alpha2"
       	kind:       "ManualScalerTrait"
       	spec: {
@@ -343,7 +344,7 @@ var _ = Describe("Test appFile parser", func() {
 							"replicas": float64(10),
 						},
 						Template: `
-      output: {
+      outputs: scaler: {
       	apiVersion: "core.oam.dev/v1alpha2"
       	kind:       "ManualScalerTrait"
       	spec: {
@@ -375,9 +376,10 @@ var _ = Describe("Test appFile parser", func() {
 				"kind":       "ManualScalerTrait",
 				"metadata": map[string]interface{}{
 					"labels": map[string]interface{}{
-						"app.oam.dev/component": "myweb",
-						"app.oam.dev/name":      "test",
-						"trait.oam.dev/type":    "scaler",
+						"app.oam.dev/component":  "myweb",
+						"app.oam.dev/name":       "test",
+						"trait.oam.dev/type":     "scaler",
+						"trait.oam.dev/resource": "scaler",
 					},
 				},
 				"spec": map[string]interface{}{"replicaCount": int64(10)},
@@ -390,7 +392,7 @@ var _ = Describe("Test appFile parser", func() {
 			}, ObjectMeta: metav1.ObjectMeta{
 				Name:      "test",
 				Namespace: "default",
-				Labels:    map[string]string{"application.oam.dev": "test"},
+				Labels:    map[string]string{oam.LabelAppName: "test"},
 			},
 			Spec: v1alpha2.ApplicationConfigurationSpec{
 				Components: []v1alpha2.ApplicationConfigurationComponent{
@@ -424,7 +426,7 @@ var _ = Describe("Test appFile parser", func() {
 			}, ObjectMeta: metav1.ObjectMeta{
 				Name:      "myweb",
 				Namespace: "default",
-				Labels:    map[string]string{"application.oam.dev": "test"},
+				Labels:    map[string]string{oam.LabelAppName: "test"},
 			}}
 		expectWorkload := &unstructured.Unstructured{
 			Object: map[string]interface{}{

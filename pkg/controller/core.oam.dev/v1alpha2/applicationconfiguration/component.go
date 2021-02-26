@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/crossplane/crossplane-runtime/pkg/logging"
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -17,10 +18,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/crossplane/crossplane-runtime/pkg/logging"
-
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha2"
-	"github.com/oam-dev/kubevela/pkg/controller/common"
+	"github.com/oam-dev/kubevela/pkg/controller/utils"
 )
 
 // ControllerRevisionComponentLabel indicate which component the revision belong to
@@ -80,7 +79,7 @@ func (c *ComponentHandler) Generic(_ event.GenericEvent, _ workqueue.RateLimitin
 func isMatch(appConfigs *v1alpha2.ApplicationConfigurationList, compName string) (bool, types.NamespacedName) {
 	for _, app := range appConfigs.Items {
 		for _, comp := range app.Spec.Components {
-			if comp.ComponentName == compName {
+			if comp.ComponentName == compName || utils.ExtractComponentName(comp.RevisionName) == compName {
 				return true, types.NamespacedName{Namespace: app.Namespace, Name: app.Name}
 			}
 		}
@@ -110,7 +109,7 @@ func (c *ComponentHandler) IsRevisionDiff(mt klog.KMetadata, curComp *v1alpha2.C
 
 	// client in controller-runtime will use informer cache
 	// use client will be more efficient
-	needNewRevision, err := common.CompareWithRevision(context.TODO(), c.Client, c.Logger, mt.GetName(), mt.GetNamespace(),
+	needNewRevision, err := utils.CompareWithRevision(context.TODO(), c.Client, c.Logger, mt.GetName(), mt.GetNamespace(),
 		curComp.Status.LatestRevision.Name, &curComp.Spec)
 	// TODO: this might be a bug that we treat all errors getting from k8s as a new revision
 	// but the client go event handler doesn't handle an error. We need to see if we can retry this
@@ -125,6 +124,10 @@ func (c *ComponentHandler) IsRevisionDiff(mt klog.KMetadata, curComp *v1alpha2.C
 func (c *ComponentHandler) createControllerRevision(mt metav1.Object, obj runtime.Object) ([]reconcile.Request, bool) {
 	curComp := obj.(*v1alpha2.Component)
 	comp := curComp.DeepCopy()
+	// No generation changed, will not create revision
+	if comp.Generation == comp.Status.ObservedGeneration {
+		return nil, false
+	}
 	diff, curRevision := c.IsRevisionDiff(mt, comp)
 	if !diff {
 		// No difference, no need to create new revision.
@@ -139,7 +142,7 @@ func (c *ComponentHandler) createControllerRevision(mt metav1.Object, obj runtim
 	}
 
 	nextRevision := curRevision + 1
-	revisionName := common.ConstructRevisionName(mt.GetName(), nextRevision)
+	revisionName := utils.ConstructRevisionName(mt.GetName(), nextRevision)
 
 	if comp.Status.ObservedGeneration != comp.Generation {
 		comp.Status.ObservedGeneration = comp.Generation

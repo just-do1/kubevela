@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	runtimev1alpha1 "github.com/crossplane/crossplane-runtime/apis/core/v1alpha1"
@@ -82,6 +83,7 @@ func (h *appHandler) apply(ctx context.Context, ac *v1alpha2.ApplicationConfigur
 	}}
 	ac.SetOwnerReferences(owners)
 	hasRolloutLogic := false
+	var newComponents []string
 	// Check if we are doing rolling out
 	if _, exist := h.app.GetAnnotations()[oam.AnnotationAppRollout]; exist || h.app.Spec.RolloutPlan != nil {
 		h.logger.Info("The application rolling out is controlled by a rollout plan")
@@ -97,11 +99,7 @@ func (h *appHandler) apply(ctx context.Context, ac *v1alpha2.ApplicationConfigur
 			return err
 		}
 		if newRevision && hasRolloutLogic {
-			// set the annotation on ac to point out which component is newly changed
-			// TODO: handle multiple components
-			ac.SetAnnotations(oamutil.MergeMapOverrideWithDst(ac.GetAnnotations(), map[string]string{
-				oam.AnnotationNewComponent: revisionName,
-			}))
+			newComponents = append(newComponents, revisionName)
 		}
 		// find the ACC that contains this component
 		for i := 0; i < len(ac.Spec.Components); i++ {
@@ -113,7 +111,10 @@ func (h *appHandler) apply(ctx context.Context, ac *v1alpha2.ApplicationConfigur
 			}
 		}
 	}
-
+	// set the annotation on ac to point out which component are newly changed
+	ac.SetAnnotations(oamutil.MergeMapOverrideWithDst(ac.GetAnnotations(), map[string]string{
+		oam.AnnotationRollingComponent: strings.Join(newComponents, common.RollingComponentsSep),
+	}))
 	if err := h.createOrUpdateAppConfig(ctx, ac); err != nil {
 		return err
 	}
@@ -232,7 +233,7 @@ func (h *appHandler) createOrUpdateComponent(ctx context.Context, comp *v1alpha2
 	updatedComp := comp.DeepCopy()
 	updatedComp.Spec.Workload.Object = nil
 	if len(preRevisionName) != 0 {
-		needNewRevision, err := common.CompareWithRevision(ctx, h.r,
+		needNewRevision, err := utils.CompareWithRevision(ctx, h.r,
 			logging.NewLogrLogger(h.logger), compName, compNameSpace, preRevisionName, &updatedComp.Spec)
 		if err != nil {
 			return "", false, errors.Wrap(err, fmt.Sprintf("compare with existing controllerRevision %s failed",
@@ -255,7 +256,7 @@ func (h *appHandler) createOrUpdateComponent(ctx context.Context, comp *v1alpha2
 		if curComp.Status.LatestRevision == nil || curComp.Status.LatestRevision.Name == preRevisionName {
 			return false, nil
 		}
-		needNewRevision, err := common.CompareWithRevision(ctx, h.r, logging.NewLogrLogger(h.logger), compName,
+		needNewRevision, err := utils.CompareWithRevision(ctx, h.r, logging.NewLogrLogger(h.logger), compName,
 			compNameSpace, curComp.Status.LatestRevision.Name, &updatedComp.Spec)
 		if err != nil {
 			// retry no matter what
@@ -281,7 +282,7 @@ func (h *appHandler) createOrUpdateAppConfig(ctx context.Context, appConfig *v1a
 	var curAppConfig v1alpha2.ApplicationConfiguration
 	// initialized
 	if h.app.Status.LatestRevision == nil {
-		revisionName := common.ConstructRevisionName(h.app.Name, 0)
+		revisionName := utils.ConstructRevisionName(h.app.Name, 0)
 		h.app.Status.LatestRevision = &v1alpha2.Revision{
 			Name:     revisionName,
 			Revision: 0,
@@ -327,16 +328,18 @@ func (h *appHandler) createOrUpdateAppConfig(ctx context.Context, appConfig *v1a
 // create a new appConfig given the latest revision in the application
 func (h *appHandler) createNewAppConfig(ctx context.Context, appConfig *v1alpha2.ApplicationConfiguration) error {
 	nextRevision := h.app.Status.LatestRevision.Revision + 1
-	revisionName := common.ConstructRevisionName(h.app.Name, nextRevision)
+	revisionName := utils.ConstructRevisionName(h.app.Name, nextRevision)
 	// update the next revision in the application's status
 	h.app.Status.LatestRevision = &v1alpha2.Revision{
-		Name:     revisionName,
-		Revision: nextRevision,
+		Name:         revisionName,
+		Revision:     nextRevision,
+		RevisionHash: appConfig.GetLabels()[oam.LabelAppConfigHash],
 	}
 	appConfig.Name = revisionName
-	// indicate that the application is new, the appConfig controller should remove this after first reconcile
+	// indicate that the application is created by the applicationController
+	// appConfig controller should set this to false after the first successful reconcile
 	appConfig.SetAnnotations(oamutil.MergeMapOverrideWithDst(appConfig.GetAnnotations(), map[string]string{
-		oam.AnnotationNewAppConfig: "true",
+		oam.AnnotationNewAppConfig: strconv.FormatBool(true),
 	}))
 	// record that last appConfig we created first in the app's status
 	// make sure that we persist the latest revision first

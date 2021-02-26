@@ -99,7 +99,8 @@ type workloads struct {
 	dm         discoverymapper.DiscoveryMapper
 }
 
-func (a *workloads) Apply(ctx context.Context, status []v1alpha2.WorkloadStatus, w []Workload, ao ...apply.ApplyOption) error {
+func (a *workloads) Apply(ctx context.Context, status []v1alpha2.WorkloadStatus, w []Workload,
+	ao ...apply.ApplyOption) error {
 	// they are all in the same namespace
 	var namespace = w[0].Workload.GetNamespace()
 	for _, wl := range w {
@@ -149,9 +150,9 @@ func (a *workloads) Apply(ctx context.Context, status []v1alpha2.WorkloadStatus,
 			}
 		}
 	}
-
 	return a.dereferenceScope(ctx, namespace, status, w)
 }
+
 func (a *workloads) ApplyOutputRef(ctx context.Context, w *unstructured.Unstructured, outputs map[string]v1alpha2.DataOutput, namespace string, ao ...apply.ApplyOption) error {
 	for _, output := range outputs {
 		if reflect.DeepEqual(output, v1alpha2.DataOutput{}) || reflect.DeepEqual(output.OutputStore, v1alpha2.StoreReference{}) {

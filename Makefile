@@ -39,19 +39,20 @@ all: build
 # Run tests
 test: vet lint staticcheck
 	go test -race -coverprofile=coverage.txt -covermode=atomic ./pkg/... ./cmd/...
+	go test -race -covermode=atomic ./references/apiserver/... ./references/cli/... ./references/common/...
 	@$(OK) unit-tests pass
 
 # Build manager binary
 build: fmt vet lint staticcheck
 	go run hack/chart/generate.go
-	go build -o bin/vela -ldflags ${LDFLAGS} cmd/vela/main.go
-	git checkout cmd/vela/fake/chart_source.go
+	go build -o bin/vela -ldflags ${LDFLAGS} references/cmd/cli/main.go
+	git checkout references/cmd/cli/fake/chart_source.go
 	@$(OK) build succeed
 
 vela-cli:
 	go run hack/chart/generate.go
-	go build -o bin/vela -ldflags ${LDFLAGS} cmd/vela/main.go
-	git checkout cmd/vela/fake/chart_source.go
+	go build -o bin/vela -ldflags ${LDFLAGS} references/cmd/cli/main.go
+	git checkout references/cmd/cli/fake/chart_source.go
 
 dashboard-build:
 	cd dashboard && npm install && cd ..
@@ -62,16 +63,16 @@ doc-gen:
 	go run hack/references/generate.go
 
 api-gen:
-	swag init -g pkg/server/route.go --output pkg/server/docs
-	swagger-codegen generate -l html2 -i pkg/server/docs/swagger.yaml -o pkg/server/docs
-	mv pkg/server/docs/index.html docs/en/developers/references/restful-api/
+	swag init -g references/apiserver/route.go --output references/apiserver/docs
+	swagger-codegen generate -l html2 -i references/apiserver/docs/swagger.yaml -o references/apiserver/docs
+	mv references/apiserver/docs/index.html docs/en/developers/references/restful-api/
 
 generate-source:
 	go run hack/frontend/source.go
 
 cross-build:
 	go run hack/chart/generate.go
-	GO111MODULE=on CGO_ENABLED=0 $(GOX) -ldflags $(LDFLAGS) -parallel=2 -output="_bin/{{.OS}}-{{.Arch}}/vela" -osarch='$(TARGETS)' ./cmd/vela/
+	GO111MODULE=on CGO_ENABLED=0 $(GOX) -ldflags $(LDFLAGS) -parallel=2 -output="_bin/{{.OS}}-{{.Arch}}/vela" -osarch='$(TARGETS)' ./references/cmd/cli/
 
 compress:
 	( \
@@ -122,7 +123,10 @@ docker-push:
 	docker push ${IMG}
 
 e2e-setup:
-	bin/vela install --set installCertManager=true --image-pull-policy IfNotPresent --image-repo vela-core-test --image-tag $(GIT_COMMIT)
+	helm repo add jetstack https://charts.jetstack.io
+	helm repo update
+	helm upgrade --install --create-namespace --namespace cert-manager cert-manager jetstack/cert-manager --version v1.2.0  --set installCRDs=true --wait
+	helm upgrade --install --create-namespace --namespace vela-system --set image.pullPolicy=IfNotPresent --set admissionWebhooks.certManager.enabled=true --set image.repository=vela-core-test --set image.tag=$(GIT_COMMIT) --wait kubevela ./charts/vela-core
 	ginkgo version
 	ginkgo -v -r e2e/setup
 	kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=vela-core,app.kubernetes.io/instance=kubevela -n vela-system --timeout=600s
@@ -171,7 +175,6 @@ core-install: manifests
 	kubectl apply -f charts/vela-core/crds/
 	kubectl apply -f charts/vela-core/templates/defwithtemplate/
 	kubectl apply -f charts/vela-core/templates/definitions/
-	kubectl apply -f charts/vela-core/templates/velaConfig.yaml
 	bin/vela workloads
 	@$(OK) install succeed
 
@@ -244,8 +247,8 @@ CUE=$(shell which cue)
 endif
 
 start-dashboard:
-	go run pkg/server/main/startAPIServer.go &
-	cd dashboard && npm install && npm start && cd ..
+	go run references/cmd/apiserver/main.go &
+	cd references/dashboard && npm install && npm start && cd ..
 
 swagger-gen:
-	$(GOBIN)/swag init -g server/route.go -d pkg/ -o pkg/server/docs/
+	$(GOBIN)/swag init -g apiserver/route.go -d pkg/ -o references/apiserver/docs/
